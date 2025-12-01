@@ -1,0 +1,439 @@
+#!/bin/bash
+
+# Exit immediately if a command exits with a non-zero status.
+set -e
+
+echo "Setting up monorepo with Next.js 14, FastAPI, pnpm, and Turborepo..."
+
+# 1. Initialize Monorepo Root
+mkdir event-sharing-monorepo
+cd event-sharing-monorepo
+
+# Initialize pnpm workspace and git
+pnpm init
+git init
+
+# Install Turborepo globally (if not already installed)
+# npm install -g turbo pnpm # Or pnpm add -g turbo
+
+# Install turborepo in the project as dev dependency
+pnpm add -D turbo concurrently
+
+# Create turbo.json
+cat << EOF > turbo.json
+{
+  "$schema": "https://turborepo.org/schema.json",
+  "pipeline": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": [".next/**", "dist/**"]
+    },
+    "lint": {
+      "outputs": []
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+      
+    },
+    "start": {
+      "cache": false
+    }
+  }
+}
+EOF
+
+# Update package.json for pnpm workspaces and scripts
+# We need to do this carefully to merge with existing content
+jq '. += {
+  "private": true,
+  "workspaces": ["apps/*", "packages/*"],
+  "scripts": {
+    "dev": "turbo run dev",
+    "build": "turbo run build",
+    "lint": "turbo run lint",
+    "start": "turbo run start",
+    "clean": "rm -rf node_modules apps/*/node_modules packages/*/node_modules apps/*/dist packages/*/dist apps/*/build packages/*/build apps/*/.next packages/*/.next"
+  }
+}' package.json > temp.json && mv temp.json package.json
+
+
+echo "Monorepo root initialized."
+
+# 2. Setup `apps` directory
+mkdir apps
+echo "Created apps directory."
+
+# 2.1. Setup FastAPI Backend (`apps/api`)
+echo "Setting up FastAPI backend..."
+mkdir apps/api
+cd apps/api
+
+# Create Python virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# Install Python dependencies
+pip install fastapi uvicorn sqlalchemy pydantic python-dotenv psycopg2-binary "python-multipart<0.0.1"
+
+# Create requirements.txt
+cat << EOF > requirements.txt
+fastapi==0.104.1
+uvicorn==0.24.0
+sqlalchemy==2.0.23
+pydantic==2.5.0
+python-dotenv==1.0.0
+psycopg2-binary==2.9.9
+python-multipart<0.0.1
+EOF
+
+# Create .env for API
+cat << EOF > .env
+DATABASE_URL=postgresql://user:password@localhost:5432/eventdb
+# For development, you can use SQLite:
+# DATABASE_URL=sqlite:///./events.db
+EOF
+
+# Create main.py (FastAPI application)
+cat << EOF > main.py
+import os
+import uuid
+from datetime import datetime
+from typing import Optional
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from sqlalchemy import create_engine, Column, String, DateTime, Integer
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+import random
+import string
+
+# Load environment variables
+load_dotenv()
+
+# --- Database Setup ---
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL environment variable is not set. Please create a .env file.")
+
+# Configure engine for PostgreSQL or SQLite
+if DATABASE_URL.startswith("postgresql"):
+    engine = create_engine(DATABASE_URL)
+else: # Assume SQLite for other URLs
+    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# --- SQLAlchemy Model ---
+class EventDB(Base):
+    __tablename__ = "events"
+    
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    title = Column(String(255), nullable=False)
+    access_code = Column(String(8), nullable=False, unique=True, index=True)
+    creator_id = Column(String(36), nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+# Create database tables
+Base.metadata.create_all(bind=engine)
+
+# --- Pydantic Models ---
+class EventBase(BaseModel):
+    title: str
+    creator_id: str
+
+class EventCreate(EventBase):
+    pass
+
+class EventResponse(EventBase):
+    id: str
+    access_code: str
+    created_at: datetime
+    
+    class Config:
+        from_attributes = True # for SQLAlchemy compatibility
+
+# --- FastAPI App ---
+app = FastAPI(
+    title="Event Sharing API",
+    description="API for creating and sharing events with unique access codes."
+)
+
+# CORS Middleware for frontend communication
+# In production, specify exact origins
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"], # Adjust for production frontend URL
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Dependency to get DB session ---
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# --- Utility Functions ---
+def generate_access_code():
+    """Generates an 8-character uppercase alphanumeric access code."""
+    characters = string.ascii_uppercase + string.digits
+    return ''.join(random.choices(characters, k=8))
+
+# --- API Endpoints ---
+
+@app.get("/health", summary="Health Check", tags=["System"])
+async def health_check():
+    """Checks if the API is running."""
+    return {"status": "ok", "message": "Event Sharing API is healthy"}
+
+@app.post("/events", response_model=EventResponse, status_code=201, summary="Create Event", tags=["Events"])
+async def create_event(event: EventCreate, db: Session = Depends(get_db)):
+    """
+    Creates a new event with a unique 8-character access code.
+    """
+    access_code = generate_access_code()
+    
+    # Ensure the generated access code is unique
+    while db.query(EventDB).filter(EventDB.access_code == access_code).first():
+        access_code = generate_access_code() # Regenerate if duplicate
+
+    db_event = EventDB(
+        title=event.title,
+        access_code=access_code,
+        creator_id=event.creator_id
+    )
+    
+    db.add(db_event)
+    db.commit()
+    db.refresh(db_event)
+    
+    return db_event
+
+@app.get("/events/{access_code}", response_model=EventResponse, summary="Get Event by Access Code", tags=["Events"])
+async def get_event(access_code: str, db: Session = Depends(get_db)):
+    """
+    Retrieves an event using its unique 8-character access code.
+    """
+    event = db.query(EventDB).filter(EventDB.access_code == access_code).first()
+    
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    
+    return event
+
+@app.get("/events/creator/{creator_id}", response_model=list[EventResponse], summary="Get Events by Creator ID", tags=["Events"])
+async def get_creator_events(creator_id: str, db: Session = Depends(get_db)):
+    """
+    Retrieves all events created by a specific creator ID.
+    """
+    events = db.query(EventDB).filter(EventDB.creator_id == creator_id).all()
+    return events
+
+# Script to run with uvicorn directly if executed
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True) # reload=True for development
+EOF
+
+# Create api/package.json for Turborepo
+cat << EOF > package.json
+{
+  "name": "api",
+  "version": "1.0.0",
+  "description": "FastAPI backend for event sharing",
+  "main": "main.py",
+  "scripts": {
+    "dev": "uvicorn main:app --host 0.0.0.0 --port 8000 --reload",
+    "start": "uvicorn main:app --host 0.0.0.0 --port 8000",
+    "build": "echo \"No build step for FastAPI, just ensure dependencies are installed\""
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
+EOF
+
+# Go back to monorepo root
+cd ../..
+echo "FastAPI backend setup complete."
+
+# 2.2. Setup Next.js Frontend (`apps/web`)
+echo "Setting up Next.js frontend..."
+# Using npx create-next-app with pnpm directly
+pnpm create next-app apps/web -- --ts --app --tailwind --no-eslint --no-src-dir
+
+cd apps/web
+
+# Install additional dependencies
+pnpm add axios zustand
+
+# Create .env.local for Next.js
+cat << EOF > .env.local
+NEXT_PUBLIC_API_URL=http://localhost:8000
+EOF
+
+# Create shared types
+mkdir -p ../../packages/shared
+cat << EOF > ../../packages/shared/index.ts
+// packages/shared/index.ts
+export interface Event {
+  id: string;
+  title: string;
+  access_code: string;
+  creator_id: string;
+  created_at: string; // ISO 8601 string
+}
+
+export interface CreateEventRequest {
+  title: string;
+  creator_id: string;
+}
+EOF
+
+# Create web/package.json for Turborepo and link shared package
+# Using pnpm import and then modifying
+jq '. += {
+  "name": "web",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "axios": "^1.6.2",
+    "next": "14.0.4",
+    "react": "^18",
+    "react-dom": "^18",
+    "zustand": "^4.4.7",
+    "shared": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/react": "^18",
+    "@types/react-dom": "^18",
+    "autoprefixer": "^10.0.1",
+    "postcss": "^8",
+    "tailwindcss": "^3.3.0",
+    "typescript": "^5"
+  }
+}' package.json > temp.json && mv temp.json package.json
+
+# Update tsconfig.json to include shared package paths
+jq '.compilerOptions.paths += {
+  "shared": ["../../packages/shared/index.ts"],
+  "shared/*": ["../../packages/shared/*"]
+}' tsconfig.json > temp.json && mv temp.json tsconfig.json
+
+# Create lib/api.ts
+mkdir -p lib
+cat << EOF > lib/api.ts
+import axios from 'axios';
+import { Event, CreateEventRequest } from 'shared'; // Import from shared package
+
+const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+
+const apiClient = axios.create({
+  baseURL: API_URL,
+  headers: {
+    'Content-Type': 'application/json',
+  },
+});
+
+export const eventAPI = {
+  createEvent: async (data: CreateEventRequest): Promise<Event> => {
+    const response = await apiClient.post('/events', data);
+    return response.data;
+  },
+
+  getEvent: async (accessCode: string): Promise<Event> => {
+    const response = await apiClient.get(\`/events/\${accessCode}\`);
+    return response.data;
+  },
+
+  getCreatorEvents: async (creatorId: string): Promise<Event[]> => {
+    const response = await apiClient.get(\`/events/creator/\${creatorId}\`);
+    return response.data;
+  },
+};
+EOF
+
+# Create lib/store.ts
+cat << EOF > lib/store.ts
+import { create } from 'zustand';
+import { Event } from 'shared'; // Import from shared package
+
+interface EventStore {
+  events: Event[];
+  creatorId: string;
+  setCreatorId: (id: string) => void;
+  addEvent: (event: Event) => void;
+  setEvents: (events: Event[]) => void;
+}
+
+export const useEventStore = create<EventStore>((set) => ({
+  events: [],
+  creatorId: '',
+  setCreatorId: (id: string) => set({ creatorId: id }),
+  addEvent: (event: Event) => set((state) => ({ events: [event, ...state.events] })),
+  setEvents: (events: Event[]) => set({ events }),
+}));
+EOF
+
+# Create components/EventCard.tsx
+mkdir -p components
+cat << 'EOF' > components/EventCard.tsx
+'use client';
+
+import { Event } from 'shared';
+import { useState } from 'react';
+
+interface EventCardProps {
+  event: Event;
+}
+
+export default function EventCard({ event }: EventCardProps) {
+  const [copied, setCopied] = useState(false);
+
+  // Dynamically get the base URL for the shareable link
+  const baseUrl = typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000';
+  const shareableLink = `${baseUrl}/events/${event.access_code}`;
+
+  const handleCopyLink = () => {
+    navigator.clipboard.writeText(shareableLink);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  const createdDate = new Date(event.created_at).toLocaleDateString('en-US', {
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+
+  return (
+    <div className="bg-gradient-to-br from-blue-50 to-indigo-50 rounded-lg shadow-lg p-6 border border-blue-200">
+      <div className="space-y-4">
+        <div>
+          <h3 className="text-2xl font-bold text-gray-900">{event.title}</h3>
+          <p className="text-sm text-gray-600 mt-1">Created on {createdDate}</p>
+        </div>
+
+        <div className="bg-white rounded-lg p-4 space-y-3">
+          <div>
+            <p className="text-xs uppercase tracking-wide font-semibold text-gray-500 mb-1">
+              Access Code
+            </p>
+            <p className="text-2xl font-mono font-
